@@ -1,3 +1,4 @@
+from __future__ import print_function
 import clustering
 import matplotlib.pyplot as plt
 # for sphinx documentation, there seems to be trouble with importing shapely
@@ -12,6 +13,7 @@ except OSError:
 import itertools
 import math
 import numpy
+from descartes import PolygonPatch
 
 def findsubsets(S,m):
     return set(itertools.combinations(S, m))
@@ -285,48 +287,53 @@ class BlobClustering(clustering.Cluster):
         self.rectangle = (shape == "rectangle") or (shape == "image")
 
     def __fix_polygon__(self,points):
+        """
+        if we an "invalid" polygon - so a polygon which crosses over itself
+        split that polygon up into smaller polygons - each of which will be valid
+        uses a recursive approach
+        :param points:
+        :return:
+        """
         fixed_polygons = None
 
         points = list(points)
 
+        # we know that we have an invalid polygon - let's get more details
+        # explain_validity will return a point where the polygon intersects itself
+        # there may be more than one such point - in which we will need to call this function recursively
         validity = explain_validity(Polygon(points))
 
-        # x,y = zip(*Polygon(points).exterior.coords)
-        # x = list(x)
-        # y = list(y)
-        # x.append(x[0])
-        # y.append(y[0])
-        # plt.plot(x,y)
-        # plt.show()
-
         assert isinstance(validity,str)
+
+        # extract the intersection point
         s,t = validity.split("[")
         x_0,y_0 = t.split(" ")
         x_0 = float(x_0)
         y_0 = float(y_0[:-1])
 
-        # search for all of the line segments which touch the intersection point
-        # we need to wrap around to the beginning to get all of the line segments
+        # search for all of the line segments which go through this intersection point
+        # hopefully there will be 2 - say for example A and B. Then we will create two "sub" polygons
+        # one from A to B and the other from B to A (wrapping around the list)
+        # both polygons will not intersect at this problem point anymore (again, there be other self intersections)
         splits = []
         for line_index in range(len(points)):
             (x_1,y_1) = points[line_index]
             (x_2,y_2) = points[(line_index+1)%len(points)]
 
+            # how close does this line get to the point?
             # the equation from a point to the nearest place on a line is from
             # https://en.wikipedia.org/wiki/Distance_from_a_point_to_a_line
             try:
                 dist = math.fabs((y_2-y_1)*x_0-(x_2-x_1)*y_0+x_2*y_1-y_2*x_1)/math.sqrt((y_2-y_1)**2+(x_2-x_1)**2)
             except ZeroDivisionError:
-                print points
-                print line_index
                 raise
 
+            # allow for a little bit of numerical error
             if dist < 0.01:
                 splits.append(line_index)
 
         # seems to be the easiest way to dealing with needing to extract
         # sublists which wrap around the end/beginning of the list
-
         points.extend(points)
         for intersection_index,line_index in enumerate(splits):
             # find the index for the next line segment with intersect (x_0,y_0)
@@ -341,10 +348,14 @@ class BlobClustering(clustering.Cluster):
             new_polygon_points = [(x_0,y_0)]
             new_polygon_points.extend(points[line_index+1:line_index2+1])
 
+            # a polygon needs 3 points to be valid - other wise we just have a line or point
+            # this can happen (forget the exact circumstances) so just skip over all such cases
             if len(new_polygon_points) < 3:
                 continue
 
             try:
+                # if we STILL don't have a valid polygon - fix it before adding it to the list
+                # i.e. make a recursive call
                 if explain_validity(Polygon(new_polygon_points)) != "Valid Geometry":
                     # if this is the first "sub"polygon - just accept it
                     if fixed_polygons is None:
@@ -358,10 +369,29 @@ class BlobClustering(clustering.Cluster):
                     else:
                         fixed_polygons.append(Polygon(new_polygon_points))
             except ValueError:
-                print new_polygon_points
+                print(new_polygon_points)
                 raise
 
         return fixed_polygons
+
+    def __remove_duplicate_points__(self,polygon_points):
+        """
+        on very rare occasions, a line segment may have zero length (so the start and end point are the same)
+        not sure why this happens but if it does skip this point
+
+        :param polygon_points:
+        :return:
+        """
+        unique_points = []
+
+        for i in range(len(polygon_points)):
+            p1 = polygon_points[i]
+            p2 = polygon_points[(i + 1) % len(polygon_points)]
+
+            if p1 != p2:
+                unique_points.append(p1)
+
+        return unique_points
 
     def __cluster__(self,markings,user_ids,tools,reduced_markings,dimensions,subject_id):
         poly_dictionary = {}
@@ -375,6 +405,9 @@ class BlobClustering(clustering.Cluster):
             if len(polygon_pts) < 3:
                 continue
 
+            # remove any duplicate points
+            polygon_pts = self.__remove_duplicate_points__(polygon_pts)
+
             poly = Polygon(polygon_pts)
             validity = explain_validity(poly)
 
@@ -383,13 +416,18 @@ class BlobClustering(clustering.Cluster):
             # correct the geometry if we have to - will probably result in a multipolygon
             # which we will keep as one object and NOT split into individual polygons
             elif validity != "Valid Geometry":
+                assert polygon_pts is not None
                 corrected_polygon = self.__fix_polygon__(polygon_pts)
-                corrected_polygon = cascaded_union(corrected_polygon)
+                if corrected_polygon is not None:
+                    # now transform that polygon from a list into one object (makes future union operations easier)
+                    corrected_polygon = cascaded_union(corrected_polygon)
 
-                if u not in poly_dictionary:
-                    poly_dictionary[u] = [(corrected_polygon,t,marking_index),]
+                    if u not in poly_dictionary:
+                        poly_dictionary[u] = [(corrected_polygon,t,marking_index),]
+                    else:
+                        poly_dictionary[u].append((corrected_polygon,t,marking_index))
                 else:
-                    poly_dictionary[u].append((corrected_polygon,t,marking_index))
+                    print("empty polygon!")
 
             else:
                 if u not in poly_dictionary:

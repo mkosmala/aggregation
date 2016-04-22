@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# from setuptools import setup, find_packages
 from __future__ import print_function
 import os
 import yaml
@@ -165,6 +164,11 @@ class AggregationAPI:
         self.cluster_algs = {}
 
     def __setup__(self):
+        """
+        set up all the connections to panoptes and different databases
+        :return:
+        """
+        print("setting up")
         # just for when we are treating an ouroboros project like a panoptes one
         # in which the subject ids will be zooniverse_ids, which are strings
         self.subject_id_type = "int"
@@ -200,11 +204,9 @@ class AggregationAPI:
         param_details = yaml.load(param_file)
 
         environment_details = param_details[self.environment]
-
         # do we have a specific date as the minimum date for this project?
         if (self.project_id in param_details) and ("default_date" in param_details[self.project_id]):
             self.previous_runtime = parser.parse(param_details[self.project_id]["default_date"])
-
         # connect to the Cassandra DB
         # only if we have given the necessary param
         # and register this run
@@ -213,6 +215,7 @@ class AggregationAPI:
             self.__register_run__()
 
         # connect to whatever postgres db we want to
+        print("connecting to postgres")
         self.__postgres_connect__(environment_details)
 
         # use for Cassandra connection - can override for Ourboros projects
@@ -285,7 +288,14 @@ class AggregationAPI:
 
             migrated_subjects = self.__migrate__(workflow_id,version)
 
+            # return the list of all aggregated subjects - originally used for determining which subjects
+            # to include in the csv output, but actually the csv output should contain all subjects
+            # whether they have been just updated or have results from a while back
+            # todo - do I still need this?
             aggregated_subjects.update(migrated_subjects)
+
+            # for this workflow, what subjects have previously been aggregated?
+            previously_aggregated = self.__get_previously_aggregated__(workflow_id)
 
             # the migrated_subject can contain classifications for subjects which are not yet retired
             # so if we want only retired subjects, make a special call
@@ -338,12 +348,12 @@ class AggregationAPI:
                 # upsert at every 250th subject - not sure if that's actually ideal but might be a good trade off
                 if (ii > 0) and (ii % 250 == 0):
                     # finally, store the results
-                    self.__upsert_results__(workflow_id,aggregations)
+                    self.__upsert_results__(workflow_id,aggregations,previously_aggregated)
                     aggregations = {}
 
             # finally upsert any left over results
             if aggregations != {}:
-                self.__upsert_results__(workflow_id,aggregations)
+                self.__upsert_results__(workflow_id,aggregations,previously_aggregated)
         return aggregated_subjects
 
     def __extract_width_height__(self,metadata):
@@ -613,6 +623,13 @@ class AggregationAPI:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # remove the temporary table
+        # if we got that far in the code
+        if self.postgres_writeable_session is not None:
+            postgres_cursor = self.postgres_writeable_session.cursor()
+            # truncate the temporary table for this project so we're just re-uploading aggregations
+            postgres_cursor.execute("drop table newvals" + str(self.project_id))
+
         # shutdown the connection to Cassandra and remove the lock so other aggregation instances
         # can run, regardless of whether an error occurred
         if self.cassandra_session is not None:
@@ -1453,6 +1470,8 @@ class AggregationAPI:
         if self.postgres_session is None:
             raise psycopg2.OperationalError()
 
+        # in the past there have been times where we are using different postgres dbs to read and write from
+        # if this is the case, here is where we make a new connection to the db that we will be writing to
         if "writeable_postgres_host" in database_details:
             details = ""
             details += "host ='" + database_details["writeable_postgres_host"] + "' "
@@ -1485,6 +1504,45 @@ class AggregationAPI:
                 raise psycopg2.OperationalError()
         else:
             self.postgres_writeable_session = self.postgres_session
+
+        assert self.postgres_writeable_session is not None
+        assert self.postgres_session is not None
+
+
+        # create a new temporary table just for this project (in case multiple people are running aggregation at once)
+        # will use this table later for doing upserts
+        try:
+            postgres_cursor = self.postgres_writeable_session.cursor()
+            postgres_cursor.execute(
+                "CREATE TEMPORARY TABLE newvals"+str(self.project_id)+"(workflow_id int, subject_id " + self.subject_id_type + ", aggregation jsonb)")
+        except psycopg2.ProgrammingError as e:
+            # not sure why the temp table should already exist but it might
+            # in which case just truncate it and start again
+            self.postgres_session.rollback()
+            postgres_cursor = self.postgres_writeable_session.cursor()
+            postgres_cursor.execute("truncate table newvals"+str(self.project_id))
+            self.postgres_session.commit()
+
+    def __get_previously_aggregated__(self,workflow_id):
+        """
+        get the list of all previously aggregated subjects - so we when upserting new results
+        we know which subjects we are updating and which we are inserting (i.e. no previously existing results)
+        :param workflow_id:
+        :return:
+        """
+
+        try:
+            postgres_cursor = self.postgres_writeable_session.cursor()
+            postgres_cursor.execute("select subject_id from aggregations where workflow_id = " + str(workflow_id))
+            previously_aggregated = [i[0] for i in postgres_cursor.fetchall()]
+        except psycopg2.ProgrammingError as e:
+            # again, not sure why there would be an error - but in this case just to be certain
+            # assume that there are no pre-existing aggregation results
+            print(e)
+            self.postgres_session.rollback()
+            previously_aggregated = []
+
+        return previously_aggregated
 
     def __readin_tasks__(self,task_dict):
         """
@@ -1820,7 +1878,7 @@ class AggregationAPI:
 
         return subjects
 
-    def __upsert_results__(self,workflow_id,aggregations):
+    def __upsert_results__(self,workflow_id,aggregations,previously_aggregated):
         """
         see
         # http://stackoverflow.com/questions/8134602/psycopg2-insert-multiple-rows-with-one-query
@@ -1830,28 +1888,8 @@ class AggregationAPI:
         """
         postgres_cursor = self.postgres_writeable_session.cursor()
 
-        # if (workflow_id == 1224) and (self.environment == "production"):
-        #     return
-
-        try:
-            postgres_cursor.execute("CREATE TEMPORARY TABLE newvals(workflow_id int, subject_id " + self.subject_id_type+ ", aggregation jsonb)")
-        except psycopg2.ProgrammingError as e:
-            # print("temporary table already exists - huh")
-            self.postgres_session.rollback()
-            postgres_cursor = self.postgres_writeable_session.cursor()
-            postgres_cursor.execute("truncate table newvals")
-            self.postgres_session.commit()
-
-
-        try:
-            postgres_cursor.execute("select subject_id from aggregations where workflow_id = " + str(workflow_id))
-            r = [i[0] for i in postgres_cursor.fetchall()]
-        except psycopg2.ProgrammingError as e:
-            print(e)
-            self.postgres_session.rollback()
-            postgres_cursor = self.postgres_writeable_session.cursor()
-            # postgres_cursor.execute("create table aggregations(workflow_id int, subject_id " + self.subject_id_type+ ", aggregation json,created_at timestamp, updated_at timestamp)")
-            r = []
+        # truncate the temporary table for this project so we're just re-uploading aggregations
+        postgres_cursor.execute("truncate table newvals" + str(self.project_id))
 
         update_str = ""
         insert_str = ""
@@ -1865,7 +1903,7 @@ class AggregationAPI:
             if subject_id == "param":
                 continue
 
-            if subject_id in r:
+            if subject_id in previously_aggregated:
                 # we are updating
                 try:
                     update_str += ","+postgres_cursor.mogrify("(%s,%s,%s)", (workflow_id,subject_id,json.dumps(aggregations[subject_id])))
@@ -1888,8 +1926,8 @@ class AggregationAPI:
             # are there any updates to actually be done?
             # todo - the updated and created at dates are not being maintained - I'm happy with that
             print("updating " + str(update_counter) + " subjects")
-            postgres_cursor.execute("INSERT INTO newvals (workflow_id, subject_id, aggregation) VALUES " + update_str[1:])
-            postgres_cursor.execute("UPDATE aggregations SET aggregation = newvals.aggregation FROM newvals WHERE newvals.subject_id = aggregations.subject_id and newvals.workflow_id = aggregations.workflow_id")
+            postgres_cursor.execute("INSERT INTO newvals"+str(self.project_id)+" (workflow_id, subject_id, aggregation) VALUES " + update_str[1:])
+            postgres_cursor.execute("UPDATE aggregations SET aggregation = newvals"+str(self.project_id)+".aggregation FROM newvals"+str(self.project_id)+" WHERE newvals"+str(self.project_id)+".subject_id = aggregations.subject_id and newvals"+str(self.project_id)+".workflow_id = aggregations.workflow_id")
         if insert_str != "":
             print("inserting " + str(insert_counter) + " subjects")
             postgres_cursor.execute("INSERT INTO aggregations (workflow_id, subject_id, aggregation, created_at, updated_at) VALUES " + insert_str[1:])
@@ -1944,7 +1982,7 @@ if __name__ == "__main__":
 
         project.__setup__()
         # project.__reset_cassandra_dbs__()
-        # aggregated_subjects = project.__aggregate__()
+        aggregated_subjects = project.__aggregate__()
 
         with csv_output.CsvOut(project) as c:
             # c.__write_out__(subject_set=aggregated_subjects)
