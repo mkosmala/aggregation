@@ -1,0 +1,9 @@
+rollbar
+botocore
+boto3
+termcolor
+PyYAML
+networkx
+cassandra-driver
+psycopg2
+pandas

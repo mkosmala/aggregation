@@ -53,8 +53,10 @@ docs/_build/
 
 *.swp
 *~
-*.txt
 .idea/workspace.xml
+.idea/misc.xml
+.idea/reduction.iml
+.idea/aggregation.iml
 config/*.yml
 *.lnk
 *.csv
